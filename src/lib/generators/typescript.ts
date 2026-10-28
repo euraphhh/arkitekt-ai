@@ -1,6 +1,6 @@
 import type { Options } from "../catalog";
 import { VERSION } from "../version";
-import { FETCH_TOOL, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, envFile, flags, knowledgeDoc, notes } from "./shared";
+import { FETCH_TOOL, MAX_STEPS, MAX_TOKENS, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, envFile, flags, knowledgeDoc, notes } from "./shared";
 
 const lines = (...parts: (string | false)[]) => parts.filter((p): p is string => p !== false).join("\n");
 
@@ -24,6 +24,12 @@ export function typescriptProject(o: Options): Record<string, string> {
   if (f.http) scripts["serve"] = "tsx src/server.ts";
   if (f.tests) scripts["test"] = "vitest run";
 
+  const limits = lines(
+    `const maxTokens = Number(process.env.MAX_TOKENS ?? ${MAX_TOKENS});`,
+    `const maxSteps = Number(process.env.MAX_STEPS ?? ${MAX_STEPS}); // tool-calling rounds per message`,
+  );
+  const stopped = "`Stopped after ${maxSteps} tool-calling steps without a final answer.`";
+
   const history = lines(
     `const histories = new Map<string, ${historyType}[]>();`,
     "",
@@ -40,6 +46,7 @@ export function typescriptProject(o: Options): Record<string, string> {
     "",
     "const client = new Anthropic();",
     `const model = process.env.MODEL ?? "${o.model}";`,
+    limits,
     `const system = "You are ${o.name}, a helpful AI agent.";`,
     f.memory && "",
     f.memory && history,
@@ -48,12 +55,13 @@ export function typescriptProject(o: Options): Record<string, string> {
     `  const messages: Anthropic.MessageParam[] = ${f.memory ? "historyFor(sessionId)" : "[]"};`,
     '  messages.push({ role: "user", content: prompt });',
     f.needsTools && "  const tools = await getTools();",
-    "  while (true) {",
+    "  for (let step = 0; step < maxSteps; step++) {",
     "    const resp = await client.messages.create({",
     "      model,",
-    "      max_tokens: 1024,",
+    "      max_tokens: maxTokens,",
     "      system,",
     "      messages,",
+    '      cache_control: { type: "ephemeral" }, // caches the prompt so far, re-read on the next step',
     f.needsTools && "      ...(tools.length ? { tools } : {}),",
     "    });",
     '    messages.push({ role: "assistant", content: resp.content });',
@@ -69,6 +77,7 @@ export function typescriptProject(o: Options): Record<string, string> {
     "    );",
     '    messages.push({ role: "user", content: results });',
     "  }",
+    `  return ${stopped};`,
     "}",
     "",
   );
@@ -79,6 +88,7 @@ export function typescriptProject(o: Options): Record<string, string> {
     "",
     "const client = new OpenAI(); // reads OPENAI_API_KEY and OPENAI_BASE_URL",
     `const model = process.env.MODEL ?? "${o.model}";`,
+    limits,
     `const system = "You are ${o.name}, a helpful AI agent.";`,
     f.memory && "",
     f.memory && history,
@@ -88,8 +98,13 @@ export function typescriptProject(o: Options): Record<string, string> {
     '  if (!messages.length) messages.push({ role: "system", content: system });',
     '  messages.push({ role: "user", content: prompt });',
     f.needsTools && "  const tools = await getTools();",
-    "  while (true) {",
-    `    const resp = await client.chat.completions.create({ model, messages${f.needsTools ? ", ...(tools.length ? { tools } : {})" : ""} });`,
+    "  for (let step = 0; step < maxSteps; step++) {",
+    "    const resp = await client.chat.completions.create({",
+    "      model,",
+    "      messages,",
+    `      ${o.provider === "ollama" ? "max_tokens" : "max_completion_tokens"}: maxTokens,`,
+    f.needsTools && "      ...(tools.length ? { tools } : {}),",
+    "    });",
     "    const msg = resp.choices[0].message;",
     "    messages.push(msg);",
     '    if (!msg.tool_calls?.length) return msg.content ?? "";',
@@ -102,6 +117,7 @@ export function typescriptProject(o: Options): Record<string, string> {
     "      });",
     "    }",
     "  }",
+    `  return ${stopped};`,
     "}",
     "",
   );
@@ -115,6 +131,7 @@ export function typescriptProject(o: Options): Record<string, string> {
     f.anthropic
       ? "const model = createAnthropic()(modelId);"
       : "const model = createOpenAI({ baseURL: process.env.OPENAI_BASE_URL }).chat(modelId); // reads OPENAI_API_KEY",
+    limits,
     `const system = "You are ${o.name}, a helpful AI agent.";`,
     f.memory && "",
     f.memory && history,
@@ -139,11 +156,18 @@ export function typescriptProject(o: Options): Record<string, string> {
     f.needsTools && "  const tools = await buildTools();",
     "  const result = await generateText({",
     "    model,",
-    "    system,",
+    f.anthropic
+      ? lines(
+          "    // A cache breakpoint on the system prompt caches the tools and the system prompt.",
+          '    system: { role: "system", content: system, providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } } },',
+        )
+      : "    system,",
     "    messages,",
-    f.needsTools && "    ...(Object.keys(tools).length ? { tools, stopWhen: stepCountIs(10) } : {}),",
+    "    maxOutputTokens: maxTokens,",
+    f.needsTools && "    ...(Object.keys(tools).length ? { tools, stopWhen: stepCountIs(maxSteps) } : {}),",
     "  });",
     "  messages.push(...result.response.messages);",
+    `  if (result.finishReason === "tool-calls") return ${stopped};`,
     "  return result.text;",
     "}",
     "",
@@ -215,6 +239,8 @@ export function typescriptProject(o: Options): Record<string, string> {
       ? 'specs.map((s) => ({ name: s.name, description: s.description, input_schema: s.schema as Anthropic.Tool["input_schema"] }))'
       : 'specs.map((s) => ({ type: "function" as const, function: { name: s.name, description: s.description, parameters: s.schema } }))';
     files["src/tools.ts"] = lines(
+      f.tools && 'import { lookup } from "node:dns/promises";',
+      f.tools && 'import { BlockList } from "node:net";',
       typeImport,
       f.rag && 'import { search } from "./rag.js";',
       f.mcp && 'import { callMcpTool, connect, isMcpTool, mcpSpecs } from "./mcp.js";',
@@ -223,11 +249,38 @@ export function typescriptProject(o: Options): Record<string, string> {
       "",
       `const baseTools: Spec[] = ${JSON.stringify(base, null, 2)};`,
       f.tools && "",
+      f.tools && "// Addresses fetch_url refuses: this machine, private networks, link-local (cloud metadata) and multicast.",
+      f.tools && "// BlockList also checks IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) against the IPv4 rules.",
+      f.tools && "const blocked = new BlockList();",
+      f.tools && 'for (const [net, prefix] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.168.0.0", 16], ["224.0.0.0", 3]] as const) {',
+      f.tools && '  blocked.addSubnet(net, prefix, "ipv4");',
+      f.tools && "}",
+      f.tools && 'for (const [net, prefix] of [["::", 127], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]] as const) {',
+      f.tools && '  blocked.addSubnet(net, prefix, "ipv6");',
+      f.tools && "}",
+      f.tools && "",
+      f.tools && "async function checkUrl(url: URL): Promise<void> {",
+      f.tools && '  const host = url.hostname.replace(/^\\[|\\]$/g, "");',
+      f.tools && "  for (const { address, family } of await lookup(host, { all: true })) {",
+      f.tools && '    if (blocked.check(address, family === 6 ? "ipv6" : "ipv4")) throw new Error(`${host} is a private or local address`);',
+      f.tools && "  }",
+      f.tools && "}",
+      f.tools && "",
       f.tools && "async function fetchUrl(url: string): Promise<string> {",
       f.tools && '  if (!/^https?:\\/\\//.test(url)) return "Only http(s) URLs are supported.";',
       f.tools && "  try {",
-      f.tools && "    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });",
-      f.tools && "    return (await res.text()).slice(0, 4000);",
+      f.tools && "    const signal = AbortSignal.timeout(10_000);",
+      f.tools && "    let target = new URL(url);",
+      f.tools && "    // Follows redirects by hand so every hop goes through checkUrl.",
+      f.tools && "    for (let hop = 0; hop < 5; hop++) {",
+      f.tools && '      if (!/^https?:$/.test(target.protocol)) return "Only http(s) URLs are supported.";',
+      f.tools && "      await checkUrl(target);",
+      f.tools && '      const res = await fetch(target, { signal, redirect: "manual" });',
+      f.tools && '      const location = res.headers.get("location");',
+      f.tools && "      if (res.status < 300 || res.status >= 400 || !location) return (await res.text()).slice(0, 4000);",
+      f.tools && "      target = new URL(location, target);",
+      f.tools && "    }",
+      f.tools && '    return "Fetch failed: too many redirects";',
       f.tools && "  } catch (err) {",
       f.tools && "    return `Fetch failed: ${err}`;",
       f.tools && "  }",
@@ -403,6 +456,12 @@ ${f.http ? 'EXPOSE 3000\nCMD ["npm", "run", "serve"]' : 'CMD ["npm", "run", "dev
       f.tools &&
         `test("fetch_url rejects non-http URLs", async () => {
   expect(await runTool("fetch_url", { url: "ftp://example.com" })).toContain("http");
+});`,
+      f.tools &&
+        `test("fetch_url rejects local addresses", async () => {
+  for (const url of ["http://localhost/", "http://127.0.0.1/", "http://[::1]/", "http://169.254.169.254/latest/meta-data/"]) {
+    expect(await runTool("fetch_url", { url })).toContain("private or local");
+  }
 });`,
       f.rag &&
         `test("search_knowledge finds the sample document", async () => {

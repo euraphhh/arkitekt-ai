@@ -19,8 +19,12 @@ export function flags(o: Options) {
   return { ...f, needsTools: f.tools || f.rag || f.mcp };
 }
 
+// Defaults for the limits every generated agent reads from the environment.
+export const MAX_TOKENS = 16000;
+export const MAX_STEPS = 10;
+
 export function envFile(o: Options): string {
-  const model = `MODEL=${o.model}\n`;
+  const model = `MODEL=${o.model}\nMAX_TOKENS=${MAX_TOKENS}\nMAX_STEPS=${MAX_STEPS}\n`;
   if (o.provider === "anthropic") return "ANTHROPIC_API_KEY=your-key-here\n" + model;
   if (o.provider === "openai") return "OPENAI_API_KEY=your-key-here\n" + model;
   return "OPENAI_BASE_URL=http://localhost:11434/v1\nOPENAI_API_KEY=ollama\n" + model;
@@ -34,7 +38,7 @@ export const TIME_TOOL = {
 
 export const FETCH_TOOL = {
   name: "fetch_url",
-  description: "Fetches an http(s) URL and returns the first 4000 characters of the response body.",
+  description: "Fetches a public http(s) URL and returns the first 4000 characters of the response body.",
   schema: {
     type: "object",
     properties: { url: { type: "string", description: "The http or https URL to fetch" } },
@@ -74,7 +78,10 @@ Put your own .md files in this folder. The agent searches them with the search_k
 
 export function notes(o: Options): string[] {
   const f = flags(o);
-  const out: string[] = [];
+  const out: string[] = [
+    "**Limits:** `MAX_TOKENS` caps each model response and `MAX_STEPS` caps the tool-calling rounds per message, so a model that keeps calling tools can't loop forever.",
+  ];
+  if (f.tools) out.push("**fetch_url:** refuses private, loopback and link-local addresses, including after redirects, so the agent can't reach your internal network or cloud metadata.");
   if (f.memory) out.push("**Memory:** each session id keeps its own message history in memory. It resets when the process restarts.");
   if (f.rag) out.push("**RAG:** add `.md` files to `knowledge/`. Search is plain keyword matching; swap `rag` for an embeddings store when you need more.");
   if (f.mcp) out.push("**MCP:** list servers in `mcp_servers.json`. The sample entry runs the filesystem server with `npx`, so it needs Node installed. Remove it if you don't want it.");

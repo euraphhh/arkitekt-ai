@@ -1,6 +1,6 @@
 import type { Options } from "../catalog";
 import { VERSION } from "../version";
-import { FETCH_TOOL, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, envFile, flags, knowledgeDoc, notes } from "./shared";
+import { FETCH_TOOL, MAX_STEPS, MAX_TOKENS, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, envFile, flags, knowledgeDoc, notes } from "./shared";
 
 const lines = (...parts: (string | false)[]) => parts.filter((p): p is string => p !== false).join("\n");
 
@@ -16,6 +16,11 @@ export function pythonProject(o: Options): Record<string, string> {
   if (f.tests) deps.push("pytest");
 
   const sessionParam = f.memory ? ', session_id: str = "default"' : "";
+  const limits = [
+    `MAX_TOKENS = int(os.getenv("MAX_TOKENS", "${MAX_TOKENS}"))`,
+    `MAX_STEPS = int(os.getenv("MAX_STEPS", "${MAX_STEPS}"))  # tool-calling rounds per message`,
+  ].join("\n");
+  const stopped = '    return f"Stopped after {MAX_STEPS} tool-calling steps without a final answer."';
 
   const agentAnthropic = lines(
     "import os",
@@ -27,6 +32,7 @@ export function pythonProject(o: Options): Record<string, string> {
     "",
     "client = AsyncAnthropic()",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
+    limits,
     `SYSTEM = "You are ${o.name}, a helpful AI agent."`,
     f.memory && "",
     f.memory && "# One message history per session id, kept in memory.",
@@ -38,12 +44,13 @@ export function pythonProject(o: Options): Record<string, string> {
     '    messages.append({"role": "user", "content": prompt})',
     f.needsTools && "    tools = await get_tools()",
     f.needsTools && '    extra = {"tools": tools} if tools else {}',
-    "    while True:",
+    "    for _ in range(MAX_STEPS):",
     "        resp = await client.messages.create(",
     "            model=MODEL,",
-    "            max_tokens=1024,",
+    "            max_tokens=MAX_TOKENS,",
     "            system=SYSTEM,",
     "            messages=messages,",
+    "            cache_control={\"type\": \"ephemeral\"},  # caches the prompt so far, re-read on the next step",
     f.needsTools && "            **extra,",
     "        )",
     '        messages.append({"role": "assistant", "content": resp.content})',
@@ -55,6 +62,7 @@ export function pythonProject(o: Options): Record<string, string> {
     '            if b.type == "tool_use"',
     "        ]",
     '        messages.append({"role": "user", "content": results})',
+    stopped,
     "",
   );
 
@@ -69,6 +77,7 @@ export function pythonProject(o: Options): Record<string, string> {
     "",
     "client = AsyncOpenAI()  # reads OPENAI_API_KEY and OPENAI_BASE_URL",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
+    limits,
     `SYSTEM = "You are ${o.name}, a helpful AI agent."`,
     f.memory && "",
     f.memory && "# One message history per session id, kept in memory.",
@@ -82,8 +91,13 @@ export function pythonProject(o: Options): Record<string, string> {
     '    messages.append({"role": "user", "content": prompt})',
     f.needsTools && "    tools = await get_tools()",
     f.needsTools && '    extra = {"tools": tools} if tools else {}',
-    "    while True:",
-    `        resp = await client.chat.completions.create(model=MODEL, messages=messages${f.needsTools ? ", **extra" : ""})`,
+    "    for _ in range(MAX_STEPS):",
+    "        resp = await client.chat.completions.create(",
+    "            model=MODEL,",
+    "            messages=messages,",
+    `            ${o.provider === "ollama" ? "max_tokens" : "max_completion_tokens"}=MAX_TOKENS,`,
+    f.needsTools && "            **extra,",
+    "        )",
     "        msg = resp.choices[0].message",
     "        messages.append(msg)",
     "        if not msg.tool_calls:",
@@ -94,6 +108,7 @@ export function pythonProject(o: Options): Record<string, string> {
     '                "tool_call_id": call.id,',
     `                "content": ${f.needsTools ? 'await run_tool(call.function.name, json.loads(call.function.arguments or "{}"))' : '""'},`,
     "            })",
+    stopped,
     "",
   );
 
@@ -102,12 +117,15 @@ export function pythonProject(o: Options): Record<string, string> {
     "",
     f.anthropic ? "from langchain_anthropic import ChatAnthropic" : "from langchain_openai import ChatOpenAI",
     "from langchain.agents import create_agent",
+    f.anthropic && "from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware",
     f.needsTools && "from langchain_core.tools import StructuredTool",
     f.memory && "from langgraph.checkpoint.memory import InMemorySaver",
+    "from langgraph.errors import GraphRecursionError",
     f.needsTools && "",
     f.needsTools && "from .tools import get_specs, run_tool",
     "",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
+    limits,
     `SYSTEM = "You are ${o.name}, a helpful AI agent."`,
     "",
     "_agent = None",
@@ -123,21 +141,28 @@ export function pythonProject(o: Options): Record<string, string> {
     "async def _get_agent():",
     "    global _agent",
     "    if _agent is None:",
-    f.anthropic ? "        model = ChatAnthropic(model=MODEL)" : '        model = ChatOpenAI(model=MODEL, base_url=os.getenv("OPENAI_BASE_URL"))',
+    f.anthropic
+      ? "        model = ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)"
+      : '        model = ChatOpenAI(model=MODEL, base_url=os.getenv("OPENAI_BASE_URL"), max_tokens=MAX_TOKENS)',
     f.needsTools
       ? `        tools = [
             StructuredTool(name=s["name"], description=s["description"], args_schema=s["schema"], coroutine=_runner(s["name"]))
             for s in await get_specs()
         ]`
       : "        tools = []",
-    `        _agent = create_agent(model, tools, system_prompt=SYSTEM${f.memory ? ", checkpointer=InMemorySaver()" : ""})`,
+    `        _agent = create_agent(model, tools, system_prompt=SYSTEM${f.anthropic ? ", middleware=[AnthropicPromptCachingMiddleware()]" : ""}${f.memory ? ", checkpointer=InMemorySaver()" : ""})`,
     "    return _agent",
     "",
     "",
     `async def run(prompt: str${sessionParam}) -> str:`,
     "    agent = await _get_agent()",
-    f.memory && '    config = {"configurable": {"thread_id": session_id}}',
-    `    result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]}${f.memory ? ", config" : ""})`,
+    "    # Each step is a model node plus a tools node. An even limit stops right after the tools run,",
+    "    # so a remembered thread never ends on a tool call without its result.",
+    `    config = {${f.memory ? '"configurable": {"thread_id": session_id}, ' : ""}"recursion_limit": 2 * MAX_STEPS}`,
+    "    try:",
+    '        result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config)',
+    "    except GraphRecursionError:",
+    "    " + stopped,
     '    return str(result["messages"][-1].text)',
     "",
   );
@@ -180,6 +205,9 @@ where = ["src"]
       : '{"type": "function", "function": {"name": s["name"], "description": s["description"], "parameters": s["schema"]}}';
     files[`src/${pkg}/tools.py`] = lines(
       f.tools && "import asyncio",
+      f.tools && "import ipaddress",
+      f.tools && "import socket",
+      f.tools && "import urllib.parse",
       f.tools && "import urllib.request",
       f.tools && "from datetime import datetime, timezone",
       f.rag && "" ,
@@ -189,11 +217,31 @@ where = ["src"]
       `BASE_TOOLS: list[dict] = ${JSON.stringify(base, null, 4)}`,
       f.tools && "",
       f.tools && "",
+      f.tools && "def _check_url(url: str) -> None:",
+      f.tools && '    """Rejects URLs that point at this machine or a private network."""',
+      f.tools && "    host = urllib.parse.urlsplit(url).hostname",
+      f.tools && "    if not host:",
+      f.tools && '        raise ValueError("the URL has no host")',
+      f.tools && "    for *_, addr in socket.getaddrinfo(host, None):",
+      f.tools && "        if not ipaddress.ip_address(addr[0]).is_global:",
+      f.tools && '            raise ValueError(f"{host} is a private or local address")',
+      f.tools && "",
+      f.tools && "",
+      f.tools && "class _CheckedRedirects(urllib.request.HTTPRedirectHandler):",
+      f.tools && "    def redirect_request(self, req, fp, code, msg, headers, newurl):",
+      f.tools && "        _check_url(newurl)",
+      f.tools && "        return super().redirect_request(req, fp, code, msg, headers, newurl)",
+      f.tools && "",
+      f.tools && "",
+      f.tools && "_opener = urllib.request.build_opener(_CheckedRedirects)",
+      f.tools && "",
+      f.tools && "",
       f.tools && "def _fetch(url: str) -> str:",
       f.tools && '    if not url.startswith(("http://", "https://")):',
       f.tools && '        return "Only http(s) URLs are supported."',
       f.tools && "    try:",
-      f.tools && "        with urllib.request.urlopen(url, timeout=10) as res:",
+      f.tools && "        _check_url(url)",
+      f.tools && "        with _opener.open(url, timeout=10) as res:",
       f.tools && '            return res.read(4000).decode("utf-8", errors="replace")',
       f.tools && "    except Exception as err:",
       f.tools && '        return f"Fetch failed: {err}"',
@@ -367,6 +415,11 @@ ${f.http ? `EXPOSE 8000\nCMD ["uvicorn", "${pkg}.server:app", "--host", "0.0.0.0
       f.tools &&
         `def test_fetch_url_rejects_non_http():
     assert "http" in asyncio.run(run_tool("fetch_url", {"url": "ftp://example.com"}))
+`,
+      f.tools &&
+        `def test_fetch_url_rejects_local_addresses():
+    for url in ["http://localhost/", "http://127.0.0.1/", "http://169.254.169.254/latest/meta-data/"]:
+        assert "private or local" in asyncio.run(run_tool("fetch_url", {"url": url}))
 `,
       f.rag &&
         `def test_search_knowledge():
