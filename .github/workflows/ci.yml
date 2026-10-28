@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  app:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  # Generates a project for each combination, installs it and runs its checks.
+  generated-projects:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ["python sdk", "python langgraph", "typescript sdk", "typescript vercel-ai"]
+        provider: [anthropic, openai]
+        caps: [all, min]
+    name: ${{ matrix.stack }} / ${{ matrix.provider }} / ${{ matrix.caps }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - run: npx tsx scripts/verify-generated.ts ${{ matrix.stack }} ${{ matrix.provider }} ${{ matrix.caps }}
