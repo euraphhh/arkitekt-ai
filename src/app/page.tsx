@@ -341,6 +341,18 @@ export default function Home() {
           </div>
         </div>
       </div>
+
+      <footer className="foot">
+        <span>
+          Made by{" "}
+          <a href="https://raphaelxavier.vercel.app" target="_blank" rel="noopener noreferrer">
+            Raphael Xavier
+          </a>
+        </span>
+        <a href="https://github.com/euraphhh/arkitekt-ai" target="_blank" rel="noopener noreferrer">
+          Source on GitHub
+        </a>
+      </footer>
     </div>
   );
 }

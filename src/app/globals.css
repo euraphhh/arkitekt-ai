@@ -166,3 +166,11 @@ button.row.file { cursor: pointer; }
 .go:active:not(:disabled) { transform: scale(0.99); }
 .go:disabled { background: #1a1d21; color: var(--muted); box-shadow: none; cursor: not-allowed; }
 .fail { margin: 12px 0 0; font-weight: 500; }
+
+.foot {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px 24px;
+  margin-top: 96px; padding-top: 24px; border-top: 1px solid var(--line);
+  color: var(--muted); font-size: 0.875rem;
+}
+.foot a { color: var(--text); text-decoration: none; border-bottom: 1px solid var(--line-strong); transition: text-shadow 0.12s, border-color 0.12s; }
+.foot a:hover { border-color: #fff; text-shadow: var(--glow); }
