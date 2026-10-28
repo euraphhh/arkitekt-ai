@@ -6,6 +6,7 @@ Versions follow [semver](https://semver.org): new options are minor releases, fi
 
 - Added agent frameworks: LangGraph (Python) and Vercel AI SDK (TypeScript).
 - Added a model selector per provider.
+- Updated the model lists: GPT-6 family for OpenAI, Claude Fable 5.1 for Anthropic, and qwen3.8, gpt-oss and llama3.1 for Ollama.
 - Added capabilities: conversation memory, RAG and MCP client.
 - Added the `fetch_url` example tool.
 - Page: file preview, copy-as-curl, and a shareable link for each setup.
