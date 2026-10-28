@@ -2,6 +2,10 @@
 
 Versions follow [semver](https://semver.org): new options are minor releases, fixes to generated templates are patch releases.
 
+## 0.2.1
+
+- Upgraded Next.js to 15.5.28 and React to 19.1.10 to fix CVE-2025-66478, which made Vercel block the deploy.
+
 ## 0.2.0
 
 - Added agent frameworks: LangGraph (Python) and Vercel AI SDK (TypeScript).
