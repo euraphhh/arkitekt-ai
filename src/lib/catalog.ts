@@ -20,16 +20,19 @@ export const catalog = {
     anthropic: [
       { id: "claude-sonnet-5-5", name: "Claude Sonnet 5.5" },
       { id: "claude-opus-5-5", name: "Claude Opus 5.5" },
+      { id: "claude-fable-5-1", name: "Claude Fable 5.1" },
       { id: "claude-haiku-5-5", name: "Claude Haiku 5.5" },
     ],
     openai: [
-      { id: "gpt-4o-mini", name: "GPT-4o mini" },
-      { id: "gpt-4o", name: "GPT-4o" },
+      { id: "gpt-6.1-sol", name: "GPT-6.1 Sol" },
+      { id: "gpt-6-astra", name: "GPT-6 Astra" },
+      { id: "gpt-6.1-terra", name: "GPT-6.1 Terra" },
+      { id: "gpt-6-luna", name: "GPT-6 Luna" },
     ],
     ollama: [
-      { id: "llama3.1", name: "Llama 3.1" },
-      { id: "qwen2.5", name: "Qwen 2.5" },
-      { id: "mistral", name: "Mistral" },
+      { id: "qwen3.8", name: "Qwen 3.8 (27B)" },
+      { id: "gpt-oss:20b", name: "gpt-oss 20B" },
+      { id: "llama3.1", name: "Llama 3.1 (8B)" },
     ],
   } satisfies Record<Provider, Option[]>,
   frameworks: [
