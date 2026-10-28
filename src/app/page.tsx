@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { VERSION } from "@/lib/version";
 import { catalog, defaultModel, frameworksFor, parseOptions, type Capability, type Options } from "@/lib/catalog";
 
 const NAME_RE = /^[a-z][a-z0-9-]{0,49}$/;
@@ -351,6 +352,9 @@ export default function Home() {
         </span>
         <a href="https://github.com/euraphhh/arkitekt-ai" target="_blank" rel="noopener noreferrer">
           Source on GitHub
+        </a>
+        <a href="https://github.com/euraphhh/arkitekt-ai/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer">
+          v{VERSION}
         </a>
       </footer>
     </div>
