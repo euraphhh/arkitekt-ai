@@ -25,6 +25,10 @@ curl -X POST http://localhost:3000/api/starter.zip \
 
 `PUT /api/starter.zip` takes the same body and returns the files as JSON. `GET /api/metadata` lists the options.
 
+## Versioning
+
+The version lives in `package.json` and shows in the page footer, in `GET /api/metadata` and in every generated README. See `CHANGELOG.md`.
+
 ## Develop
 
 ```bash
