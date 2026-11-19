@@ -593,9 +593,9 @@ import sys
 import time
 
 
-def event(name: str, **fields) -> None:
+def event(kind: str, /, **fields) -> None:
     """Writes one JSON line to stderr. Send it to any log collector, or swap this module for OpenTelemetry."""
-    print(json.dumps({"ts": round(time.time(), 3), "event": name, **fields}), file=sys.stderr, flush=True)
+    print(json.dumps({"ts": round(time.time(), 3), "event": kind, **fields}), file=sys.stderr, flush=True)
 
 
 def ms_since(start: float) -> int:
