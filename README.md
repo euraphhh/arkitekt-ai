@@ -9,7 +9,7 @@ A project generator for AI agents, in the spirit of Spring Initializr. Pick a la
 | Language | Python, TypeScript |
 | Framework | Provider SDK (both), LangGraph (Python), Vercel AI SDK (TypeScript) |
 | Provider | Anthropic, OpenAI, Ollama |
-| Capabilities | Tools, conversation memory, RAG, MCP client, HTTP API, Docker, tests |
+| Capabilities | Tools, conversation memory, RAG, MCP client, streaming, structured output, human in the loop, observability, evals, HTTP API, Docker, tests |
 
 The page also shows every generated file before you download, and the setup lives in the URL so you can share it.
 

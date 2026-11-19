@@ -27,7 +27,7 @@ A non-zero exit code points to the log that failed. Each run generates the proje
 - **Request parameters in Python**: `compileall` and import pass even when the SDK rejects an argument at call time. TypeScript catches unknown fields at `tsc`, Python doesn't.
 - **Loop behavior**: no test calls a model.
 
-For the last two, run the agent against `scripts/stub-api.py`, a stub that always asks for a tool, and look at what it sends. It answers `POST /v1/messages` with a `tool_use` block (Anthropic) and `POST /v1/chat/completions` with `tool_calls` (OpenAI), and logs each request body as a JSON line. Generate a project with the `tools` capability (the page, or `PUT /api/starter.zip`), install it, then:
+For the last two, run the agent against `scripts/stub-api.py`, a stub that always asks for a tool, and look at what it sends. It answers `POST /v1/messages` with a `tool_use` block (Anthropic) and `POST /v1/chat/completions` with `tool_calls` (OpenAI), and logs each request body as a JSON line. When the request sets `stream`, it answers with server-sent events in each provider's format, so the streaming capability can be checked the same way. Generate a project with the `tools` capability (the page, or `PUT /api/starter.zip`), install it, then:
 
 ```bash
 python3 scripts/stub-api.py 8701 /tmp/requests.jsonl &

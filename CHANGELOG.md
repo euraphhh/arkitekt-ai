@@ -2,6 +2,18 @@
 
 Versions follow [semver](https://semver.org): new options are minor releases, fixes to generated templates are patch releases.
 
+## 0.3.0
+
+New capabilities, for every language, framework and provider:
+
+- **Streaming:** the CLI prints the reply as it arrives. With the HTTP API, `POST /chat/stream` takes the same body as `/chat` and sends server-sent events. `MAX_STEPS` and `MAX_TOKENS` still apply.
+- **Structured output:** `extract()` turns free text into a `Contact` validated by a Pydantic (Python) or Zod (TypeScript) schema. It uses a forced tool on Anthropic, a strict `response_format` on OpenAI and Ollama, `with_structured_output` in LangGraph and `Output.object` in the Vercel AI SDK. Run it with `python -m <package>.extract "..."` or `npm run extract -- "..."`.
+- **Human in the loop:** tools matching `CONFIRM_TOOLS` (in `.env.example`, default `fetch_url` and every MCP tool) need a yes before they run. The CLI asks in the terminal. Anything else, including the HTTP API, declines them until you plug in your own approver.
+- **Observability:** one JSON line on stderr per model call (step, tokens, timing, stop reason) and per tool call (name, timing, size), ready for any log collector.
+- **Evals:** `evals/cases.json` holds test prompts and the phrases each answer must contain. `python -m <package>.evals` or `npm run eval` runs them against the real model and exits non-zero when one fails.
+
+Each capability comes with tests that run without an API key.
+
 ## 0.2.2
 
 Fixes to the generated projects:
