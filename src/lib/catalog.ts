@@ -4,7 +4,19 @@ export type FrameworkOption = Option & { languages: Language[] };
 export type Language = "python" | "typescript";
 export type Provider = "anthropic" | "openai" | "ollama";
 export type Framework = "sdk" | "langgraph" | "vercel-ai";
-export type Capability = "tools" | "memory" | "rag" | "mcp" | "http" | "docker" | "tests";
+export type Capability =
+  | "tools"
+  | "memory"
+  | "rag"
+  | "mcp"
+  | "streaming"
+  | "structured"
+  | "approval"
+  | "observability"
+  | "evals"
+  | "http"
+  | "docker"
+  | "tests";
 
 export const catalog = {
   languages: [
@@ -45,6 +57,11 @@ export const catalog = {
     { id: "memory", name: "Conversation memory", description: "Remembers earlier messages in each session" },
     { id: "rag", name: "RAG", description: "Answers from your own documents in knowledge/" },
     { id: "mcp", name: "MCP client", description: "Connects to the servers in mcp_servers.json" },
+    { id: "streaming", name: "Streaming", description: "Prints the reply token by token, and serves it as server-sent events on POST /chat/stream" },
+    { id: "structured", name: "Structured output", description: "extract() returns typed data validated by a Pydantic or Zod schema" },
+    { id: "approval", name: "Human in the loop", description: "Asks before running fetch_url and MCP tools (needs Tools or MCP)" },
+    { id: "observability", name: "Observability", description: "JSON log line per model call and tool call, with tokens and timings" },
+    { id: "evals", name: "Evals", description: "Test cases in evals/cases.json and a runner that scores the agent's answers" },
     { id: "http", name: "HTTP API", description: "Serves the agent on POST /chat" },
     { id: "docker", name: "Docker", description: "Ready-to-build Dockerfile" },
     { id: "tests", name: "Tests", description: "Example tests for the generated code" },

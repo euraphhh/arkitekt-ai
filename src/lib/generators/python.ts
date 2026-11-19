@@ -1,6 +1,6 @@
 import type { Options } from "../catalog";
 import { VERSION } from "../version";
-import { FETCH_TOOL, MAX_STEPS, MAX_TOKENS, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, envFile, flags, knowledgeDoc, notes } from "./shared";
+import { FETCH_TOOL, MAX_STEPS, MAX_TOKENS, MCP_CONFIG, SEARCH_TOOL, TIME_TOOL, confirmTools, envFile, evalCases, flags, knowledgeDoc, notes } from "./shared";
 
 const lines = (...parts: (string | false)[]) => parts.filter((p): p is string => p !== false).join("\n");
 
@@ -12,47 +12,88 @@ export function pythonProject(o: Options): Record<string, string> {
     ? ["langchain>=1.0", "langgraph>=1.0", f.anthropic ? "langchain-anthropic>=1.0" : "langchain-openai>=1.0", "python-dotenv"]
     : [f.anthropic ? "anthropic>=2,<3" : "openai>=3,<4", "python-dotenv"];
   if (f.mcp) deps.push("mcp>=1.2");
+  if (f.structured) deps.push("pydantic>=2,<3");
   if (f.http) deps.push("fastapi", "uvicorn");
   if (f.tests) deps.push("pytest");
 
   const sessionParam = f.memory ? ', session_id: str = "default"' : "";
+  const streamParam = f.streaming ? ", on_text: Callable[[str], None] | None = None" : "";
+  const signature = `async def run(prompt: str${sessionParam}${streamParam}) -> str:`;
   const limits = [
     `MAX_TOKENS = int(os.getenv("MAX_TOKENS", "${MAX_TOKENS}"))`,
     `MAX_STEPS = int(os.getenv("MAX_STEPS", "${MAX_STEPS}"))  # tool-calling rounds per message`,
   ].join("\n");
-  const stopped = '    return f"Stopped after {MAX_STEPS} tool-calling steps without a final answer."';
+  const stopMsg = 'f"Stopped after {MAX_STEPS} tool-calling steps without a final answer."';
+  // When streaming, the stop message goes to on_text too, so the caller sees why the reply ended.
+  const stopped = (indent: string) =>
+    f.streaming
+      ? lines(`${indent}note = ${stopMsg}`, `${indent}if on_text:`, `${indent}    on_text(note)`, `${indent}return note`)
+      : `${indent}return ${stopMsg}`;
+  const header = (sdkImport: string) =>
+    lines(
+      f.needsTools && f.sdk && !f.anthropic && "import json",
+      "import os",
+      f.observability && "import time",
+      f.memory && "from collections import defaultdict",
+      f.streaming && "from collections.abc import Callable",
+      "",
+      sdkImport,
+      (f.needsTools || f.observability) && "",
+      f.observability && "from . import telemetry",
+      f.needsTools && (f.sdk ? "from .tools import get_tools, run_tool" : "from .tools import get_specs, run_tool"),
+    );
+  const memory = lines(
+    "# One message history per session id, kept in memory.",
+    "HISTORY: dict[str, list] = defaultdict(list)",
+  );
 
   const agentAnthropic = lines(
-    "import os",
-    f.memory && "from collections import defaultdict",
-    "",
-    "from anthropic import AsyncAnthropic",
-    f.needsTools && "",
-    f.needsTools && "from .tools import get_tools, run_tool",
+    header("from anthropic import AsyncAnthropic"),
     "",
     "client = AsyncAnthropic()",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
     limits,
     `SYSTEM = "You are ${o.name}, a helpful AI agent."`,
     f.memory && "",
-    f.memory && "# One message history per session id, kept in memory.",
-    f.memory && "HISTORY: dict[str, list] = defaultdict(list)",
+    f.memory && memory,
     "",
     "",
-    `async def run(prompt: str${sessionParam}) -> str:`,
+    signature,
     `    messages = ${f.memory ? "HISTORY[session_id]" : "[]"}`,
     '    messages.append({"role": "user", "content": prompt})',
     f.needsTools && "    tools = await get_tools()",
     f.needsTools && '    extra = {"tools": tools} if tools else {}',
-    "    for _ in range(MAX_STEPS):",
-    "        resp = await client.messages.create(",
+    `    for ${f.observability ? "step" : "_"} in range(MAX_STEPS):`,
+    f.observability && "        start = time.perf_counter()",
+    f.streaming ? "        async with client.messages.stream(" : "        resp = await client.messages.create(",
     "            model=MODEL,",
     "            max_tokens=MAX_TOKENS,",
     "            system=SYSTEM,",
     "            messages=messages,",
     "            cache_control={\"type\": \"ephemeral\"},  # caches the prompt so far, re-read on the next step",
     f.needsTools && "            **extra,",
-    "        )",
+    f.streaming
+      ? lines(
+          "        ) as stream:",
+          "            async for text in stream.text_stream:",
+          "                if on_text:",
+          "                    on_text(text)",
+          "            resp = await stream.get_final_message()",
+        )
+      : "        )",
+    f.observability &&
+      lines(
+        "        telemetry.event(",
+        '            "model_call",',
+        "            step=step,",
+        "            model=MODEL,",
+        "            ms=telemetry.ms_since(start),",
+        "            input_tokens=resp.usage.input_tokens,",
+        "            output_tokens=resp.usage.output_tokens,",
+        "            cache_read_tokens=resp.usage.cache_read_input_tokens,",
+        "            stop_reason=resp.stop_reason,",
+        "        )",
+      ),
     '        messages.append({"role": "assistant", "content": resp.content})',
     '        if resp.stop_reason != "tool_use":',
     '            return "".join(b.text for b in resp.content if b.type == "text")',
@@ -62,58 +103,114 @@ export function pythonProject(o: Options): Record<string, string> {
     '            if b.type == "tool_use"',
     "        ]",
     '        messages.append({"role": "user", "content": results})',
-    stopped,
+    stopped("    "),
     "",
   );
 
+  const tokensParam = o.provider === "ollama" ? "max_tokens" : "max_completion_tokens";
+  const toolResult = (name: string, args: string) =>
+    f.needsTools ? `await run_tool(${name}, json.loads(${args} or "{}"))` : '""';
+  const usageEvent = lines(
+    "        telemetry.event(",
+    '            "model_call",',
+    "            step=step,",
+    "            model=MODEL,",
+    "            ms=telemetry.ms_since(start),",
+    "            input_tokens=usage.prompt_tokens if usage else None,",
+    "            output_tokens=usage.completion_tokens if usage else None,",
+    "        )",
+  );
+  const openaiCall = lines(
+    "            model=MODEL,",
+    "            messages=messages,",
+    `            ${tokensParam}=MAX_TOKENS,`,
+    f.streaming && "            stream=True,",
+    f.streaming && f.observability && '            stream_options={"include_usage": True},',
+    f.needsTools && "            **extra,",
+    "        )",
+  );
+  const openaiStep = f.streaming
+    ? lines(
+        "        stream = await client.chat.completions.create(",
+        openaiCall,
+        "        # Tool calls arrive in pieces, keyed by index, so they're put back together as the chunks come in.",
+        `        content, calls${f.observability ? ", usage" : ""} = "", {}${f.observability ? ", None" : ""}`,
+        "        async for chunk in stream:",
+        f.observability && "            usage = chunk.usage or usage",
+        "            if not chunk.choices:",
+        "                continue",
+        "            delta = chunk.choices[0].delta",
+        "            if delta.content:",
+        "                content += delta.content",
+        "                if on_text:",
+        "                    on_text(delta.content)",
+        "            for tc in delta.tool_calls or []:",
+        '                call = calls.setdefault(tc.index, {"id": "", "type": "function", "function": {"name": "", "arguments": ""}})',
+        '                call["id"] = tc.id or call["id"]',
+        "                if tc.function:",
+        '                    call["function"]["name"] += tc.function.name or ""',
+        '                    call["function"]["arguments"] += tc.function.arguments or ""',
+        f.observability && usageEvent,
+        "        tool_calls = list(calls.values())",
+        '        messages.append({"role": "assistant", "content": content, **({"tool_calls": tool_calls} if tool_calls else {})})',
+        "        if not tool_calls:",
+        "            return content",
+        "        for call in tool_calls:",
+        "            messages.append({",
+        '                "role": "tool",',
+        '                "tool_call_id": call["id"],',
+        `                "content": ${toolResult('call["function"]["name"]', 'call["function"]["arguments"]')},`,
+        "            })",
+      )
+    : lines(
+        "        resp = await client.chat.completions.create(",
+        openaiCall,
+        "        msg = resp.choices[0].message",
+        f.observability && "        usage = resp.usage",
+        f.observability && usageEvent,
+        "        messages.append(msg)",
+        "        if not msg.tool_calls:",
+        '            return msg.content or ""',
+        "        for call in msg.tool_calls:",
+        "            messages.append({",
+        '                "role": "tool",',
+        '                "tool_call_id": call.id,',
+        `                "content": ${toolResult("call.function.name", "call.function.arguments")},`,
+        "            })",
+      );
+
   const agentOpenAI = lines(
-    f.needsTools && "import json",
-    "import os",
-    f.memory && "from collections import defaultdict",
-    "",
-    "from openai import AsyncOpenAI",
-    f.needsTools && "",
-    f.needsTools && "from .tools import get_tools, run_tool",
+    header("from openai import AsyncOpenAI"),
     "",
     "client = AsyncOpenAI()  # reads OPENAI_API_KEY and OPENAI_BASE_URL",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
     limits,
     `SYSTEM = "You are ${o.name}, a helpful AI agent."`,
     f.memory && "",
-    f.memory && "# One message history per session id, kept in memory.",
-    f.memory && "HISTORY: dict[str, list] = defaultdict(list)",
+    f.memory && memory,
     "",
     "",
-    `async def run(prompt: str${sessionParam}) -> str:`,
+    signature,
     `    messages = ${f.memory ? "HISTORY[session_id]" : "[]"}`,
     "    if not messages:",
     '        messages.append({"role": "system", "content": SYSTEM})',
     '    messages.append({"role": "user", "content": prompt})',
     f.needsTools && "    tools = await get_tools()",
     f.needsTools && '    extra = {"tools": tools} if tools else {}',
-    "    for _ in range(MAX_STEPS):",
-    "        resp = await client.chat.completions.create(",
-    "            model=MODEL,",
-    "            messages=messages,",
-    `            ${o.provider === "ollama" ? "max_tokens" : "max_completion_tokens"}=MAX_TOKENS,`,
-    f.needsTools && "            **extra,",
-    "        )",
-    "        msg = resp.choices[0].message",
-    "        messages.append(msg)",
-    "        if not msg.tool_calls:",
-    '            return msg.content or ""',
-    "        for call in msg.tool_calls:",
-    "            messages.append({",
-    '                "role": "tool",',
-    '                "tool_call_id": call.id,',
-    `                "content": ${f.needsTools ? 'await run_tool(call.function.name, json.loads(call.function.arguments or "{}"))' : '""'},`,
-    "            })",
-    stopped,
+    `    for ${f.observability ? "step" : "_"} in range(MAX_STEPS):`,
+    f.observability && "        start = time.perf_counter()",
+    openaiStep,
+    stopped("    "),
     "",
   );
 
+  const chatModel = f.anthropic
+    ? "ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)"
+    : 'ChatOpenAI(model=MODEL, base_url=os.getenv("OPENAI_BASE_URL"), max_tokens=MAX_TOKENS)';
   const agentLangGraph = lines(
     "import os",
+    f.observability && "import time",
+    f.streaming && "from collections.abc import Callable",
     "",
     f.anthropic ? "from langchain_anthropic import ChatAnthropic" : "from langchain_openai import ChatOpenAI",
     "from langchain.agents import create_agent",
@@ -121,7 +218,8 @@ export function pythonProject(o: Options): Record<string, string> {
     f.needsTools && "from langchain_core.tools import StructuredTool",
     f.memory && "from langgraph.checkpoint.memory import InMemorySaver",
     "from langgraph.errors import GraphRecursionError",
-    f.needsTools && "",
+    (f.needsTools || f.observability) && "",
+    f.observability && "from . import telemetry",
     f.needsTools && "from .tools import get_specs, run_tool",
     "",
     `MODEL = os.getenv("MODEL", "${o.model}")`,
@@ -141,9 +239,7 @@ export function pythonProject(o: Options): Record<string, string> {
     "async def _get_agent():",
     "    global _agent",
     "    if _agent is None:",
-    f.anthropic
-      ? "        model = ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)"
-      : '        model = ChatOpenAI(model=MODEL, base_url=os.getenv("OPENAI_BASE_URL"), max_tokens=MAX_TOKENS)',
+    `        model = ${chatModel}`,
     f.needsTools
       ? `        tools = [
             StructuredTool(name=s["name"], description=s["description"], args_schema=s["schema"], coroutine=_runner(s["name"]))
@@ -154,15 +250,42 @@ export function pythonProject(o: Options): Record<string, string> {
     "    return _agent",
     "",
     "",
-    `async def run(prompt: str${sessionParam}) -> str:`,
+    f.observability &&
+      lines(
+        "def _log_steps(messages: list, start: float) -> None:",
+        '    """Logs the model calls since the last user message, from the usage on each AI message."""',
+        '    turn = max(i for i, m in enumerate(messages) if m.type == "human")',
+        '    steps = [m for m in messages[turn + 1 :] if m.type == "ai"]',
+        "    for step, m in enumerate(steps):",
+        "        usage = m.usage_metadata or {}",
+        '        telemetry.event("model_call", step=step, model=MODEL, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"))',
+        '    telemetry.event("run", steps=len(steps), ms=telemetry.ms_since(start))',
+        "",
+        "",
+      ),
+    signature,
     "    agent = await _get_agent()",
     "    # Each step is a model node plus a tools node. An even limit stops right after the tools run,",
     "    # so a remembered thread never ends on a tool call without its result.",
     `    config = {${f.memory ? '"configurable": {"thread_id": session_id}, ' : ""}"recursion_limit": 2 * MAX_STEPS}`,
+    '    inputs = {"messages": [{"role": "user", "content": prompt}]}',
+    f.observability && "    start = time.perf_counter()",
     "    try:",
-    '        result = await agent.ainvoke({"messages": [{"role": "user", "content": prompt}]}, config)',
+    f.streaming
+      ? lines(
+          "        result: dict = {}",
+          '        async for mode, data in agent.astream(inputs, config, stream_mode=["messages", "values"]):',
+          '            if mode == "values":',
+          "                result = data",
+          "                continue",
+          "            chunk, meta = data",
+          '            if on_text and meta.get("langgraph_node") == "model" and chunk.text:',
+          "                on_text(chunk.text)",
+        )
+      : "        result = await agent.ainvoke(inputs, config)",
     "    except GraphRecursionError:",
-    "    " + stopped,
+    stopped("        "),
+    f.observability && '    _log_steps(result["messages"], start)',
     '    return str(result["messages"][-1].text)',
     "",
   );
@@ -188,13 +311,15 @@ where = ["src"]
     ".gitignore": ".env\n__pycache__/\n.venv/\n*.egg-info/\n",
     [`src/${pkg}/__init__.py`]: "",
     [`src/${pkg}/agent.py`]: f.langgraph ? agentLangGraph : f.anthropic ? agentAnthropic : agentOpenAI,
-    [`src/${pkg}/__main__.py`]: mainPy(f.mcp),
+    [`src/${pkg}/__main__.py`]: mainPy(f),
     "README.md": readme(o, [
       "python -m venv .venv && source .venv/bin/activate  # Windows: .venv\\Scripts\\activate",
       "pip install -e .",
       "cp .env.example .env  # fill in your settings",
       `python -m ${pkg}`,
-      ...(f.http ? [`uvicorn ${pkg}.server:app --reload  # POST /chat`] : []),
+      ...(f.http ? [`uvicorn ${pkg}.server:app --reload  # POST /chat${f.streaming ? ", POST /chat/stream" : ""}`] : []),
+      ...(f.structured ? [`python -m ${pkg}.extract "Ana Silva, ana@example.com, works at Acme"`] : []),
+      ...(f.evals ? [`python -m ${pkg}.evals`] : []),
     ]),
   };
 
@@ -203,18 +328,45 @@ where = ["src"]
     const fmt = f.anthropic
       ? '{"name": s["name"], "description": s["description"], "input_schema": s["schema"]}'
       : '{"type": "function", "function": {"name": s["name"], "description": s["description"], "parameters": s["schema"]}}';
+    const wrap = f.approval || f.observability;
     files[`src/${pkg}/tools.py`] = lines(
       f.tools && "import asyncio",
+      f.approval && "import fnmatch",
       f.tools && "import ipaddress",
+      f.approval && "import os",
       f.tools && "import socket",
+      f.observability && "import time",
       f.tools && "import urllib.parse",
       f.tools && "import urllib.request",
+      f.approval && "from collections.abc import Awaitable, Callable",
       f.tools && "from datetime import datetime, timezone",
-      f.rag && "" ,
+      (f.rag || f.mcp || f.observability) && "",
       f.rag && "from . import rag",
       f.mcp && "from . import mcp_client",
+      f.observability && "from . import telemetry",
       "",
       `BASE_TOOLS: list[dict] = ${JSON.stringify(base, null, 4)}`,
+      f.approval &&
+        lines(
+          "",
+          "# Tools that reach outside this process. Each call needs a yes from the approver.",
+          `CONFIRM_TOOLS = [p.strip() for p in os.getenv("CONFIRM_TOOLS", "${confirmTools(o)}").split(",") if p.strip()]`,
+          "",
+          "Approver = Callable[[str, dict], Awaitable[bool]]",
+          "",
+          "",
+          "async def _decline(name: str, args: dict) -> bool:",
+          "    return False",
+          "",
+          "",
+          "_approver: Approver = _decline",
+          "",
+          "",
+          "def set_approver(approver: Approver) -> None:",
+          '    """Decides whether a tool in CONFIRM_TOOLS may run. The CLI asks in the terminal; without one, calls are declined."""',
+          "    global _approver",
+          "    _approver = approver",
+        ),
       f.tools && "",
       f.tools && "",
       f.tools && "def _check_url(url: str) -> None:",
@@ -258,7 +410,19 @@ where = ["src"]
       f.sdk && `    return [${fmt} for s in await get_specs()]`,
       "",
       "",
-      "async def run_tool(name: str, args: dict) -> str:",
+      wrap &&
+        lines(
+          "async def run_tool(name: str, args: dict) -> str:",
+          f.approval && "    if any(fnmatch.fnmatchcase(name, p) for p in CONFIRM_TOOLS) and not await _approver(name, args):",
+          f.approval && '        return "The user declined this tool call."',
+          f.observability && "    start = time.perf_counter()",
+          f.observability && "    result = await _call(name, args)",
+          f.observability && '    telemetry.event("tool_call", name=name, ms=telemetry.ms_since(start), chars=len(result))',
+          f.observability ? "    return result" : "    return await _call(name, args)",
+          "",
+          "",
+        ),
+      `async def ${wrap ? "_call" : "run_tool"}(name: str, args: dict) -> str:`,
       f.tools && '    if name == "get_current_time":',
       f.tools && "        return datetime.now(timezone.utc).isoformat()",
       f.tools && '    if name == "fetch_url":',
@@ -361,13 +525,16 @@ async def close() -> None:
 
   if (f.http) {
     files[`src/${pkg}/server.py`] = lines(
+      f.streaming && "import asyncio",
+      f.streaming && "import json",
       f.mcp && "from contextlib import asynccontextmanager",
-      f.mcp && "",
+      (f.mcp || f.streaming) && "",
       "from dotenv import load_dotenv",
       "",
       "load_dotenv()",
       "",
       "from fastapi import FastAPI  # noqa: E402",
+      f.streaming && "from fastapi.responses import StreamingResponse  # noqa: E402",
       "from pydantic import BaseModel  # noqa: E402",
       "",
       f.mcp && "from . import mcp_client  # noqa: E402",
@@ -392,6 +559,103 @@ async def close() -> None:
       '@app.post("/chat")',
       "async def chat(req: ChatRequest):",
       `    return {"reply": await run(req.message${f.memory ? ", req.session_id" : ""})}`,
+      f.streaming &&
+        lines(
+          "",
+          "",
+          '@app.post("/chat/stream")',
+          "async def chat_stream(req: ChatRequest):",
+          '    """Sends the reply as server-sent events, one JSON-encoded text chunk per event."""',
+          "    queue: asyncio.Queue[str | None] = asyncio.Queue()",
+          "",
+          "    async def produce() -> None:",
+          "        try:",
+          `            await run(req.message${f.memory ? ", req.session_id" : ""}, on_text=queue.put_nowait)`,
+          "        finally:",
+          "            queue.put_nowait(None)",
+          "",
+          "    async def events():",
+          "        task = asyncio.create_task(produce())",
+          "        while (text := await queue.get()) is not None:",
+          '            yield f"data: {json.dumps(text)}\\n\\n"',
+          "        await task",
+          '        yield "event: done\\ndata: {}\\n\\n"',
+          "",
+          '    return StreamingResponse(events(), media_type="text/event-stream")',
+        ),
+      "",
+    );
+  }
+
+  if (f.observability) {
+    files[`src/${pkg}/telemetry.py`] = `import json
+import sys
+import time
+
+
+def event(name: str, **fields) -> None:
+    """Writes one JSON line to stderr. Send it to any log collector, or swap this module for OpenTelemetry."""
+    print(json.dumps({"ts": round(time.time(), 3), "event": name, **fields}), file=sys.stderr, flush=True)
+
+
+def ms_since(start: float) -> int:
+    return round((time.perf_counter() - start) * 1000)
+`;
+  }
+
+  if (f.structured) {
+    files[`src/${pkg}/schemas.py`] = `from pydantic import BaseModel, ConfigDict, Field
+
+
+class Contact(BaseModel):
+    """What extract() pulls out of free text. Change the fields to fit your data."""
+
+    model_config = ConfigDict(extra="forbid")  # strict JSON schemas need additionalProperties: false
+
+    name: str
+    email: str = Field(description="Empty if the text has none")
+    company: str = Field(description="Empty if the text has none")
+`;
+    files[`src/${pkg}/extract.py`] = extractPy(o, f);
+  }
+
+  if (f.evals) {
+    files["evals/cases.json"] = evalCases(o);
+    files[`src/${pkg}/evals.py`] = lines(
+      "import asyncio",
+      "import json",
+      "import sys",
+      "from pathlib import Path",
+      "",
+      "from dotenv import load_dotenv",
+      "",
+      'CASES = Path(__file__).resolve().parents[2] / "evals" / "cases.json"',
+      "",
+      "",
+      "def check(output: str, case: dict) -> list[str]:",
+      '    """Returns the phrases from case["contains"] that are missing from the output, ignoring case."""',
+      '    return [p for p in case.get("contains", []) if p.lower() not in output.lower()]',
+      "",
+      "",
+      "async def main() -> int:",
+      "    load_dotenv()",
+      "    # Imported here so the tests can use check() without an API key.",
+      "    from .agent import run",
+      f.mcp && "    from . import mcp_client",
+      "",
+      '    cases = json.loads(CASES.read_text(encoding="utf-8"))',
+      "    failed = 0",
+      "    for i, case in enumerate(cases):",
+      `        missing = check(await run(case["input"]${f.memory ? ', f"eval-{i}"' : ""}), case)`,
+      "        failed += bool(missing)",
+      `        print(("FAIL" if missing else "PASS") + f"  {case['input']}" + (f"  missing: {missing}" if missing else ""))`,
+      f.mcp && "    await mcp_client.close()",
+      '    print(f"\\n{len(cases) - failed}/{len(cases)} passed")',
+      "    return 1 if failed else 0",
+      "",
+      "",
+      'if __name__ == "__main__":',
+      "    sys.exit(asyncio.run(main()))",
       "",
     );
   }
@@ -407,7 +671,7 @@ ${f.http ? `EXPOSE 8000\nCMD ["uvicorn", "${pkg}.server:app", "--host", "0.0.0.0
   }
 
   if (f.tests) {
-    const tests = [
+    const toolTests = [
       f.tools &&
         `def test_get_current_time():
     assert "T" in asyncio.run(run_tool("get_current_time", {}))
@@ -426,11 +690,58 @@ ${f.http ? `EXPOSE 8000\nCMD ["uvicorn", "${pkg}.server:app", "--host", "0.0.0.0
     result = asyncio.run(run_tool("search_knowledge", {"query": "generated agent"}))
     assert "agent" in result.lower()
 `,
-    ].filter(Boolean);
-    files["tests/test_smoke.py"] = tests.length
-      ? `import asyncio
+      f.approval &&
+        f.tools &&
+        `def test_tools_need_approval():
+    async def deny(name, args):
+        return False
 
-from ${pkg}.tools import run_tool
+    set_approver(deny)
+    assert "declined" in asyncio.run(run_tool("fetch_url", {"url": "https://example.com"}))
+`,
+    ].filter(Boolean) as string[];
+    const otherTests = [
+      f.structured &&
+        `def test_contact_schema():
+    assert Contact.model_validate({"name": "Ana", "email": "", "company": ""}).name == "Ana"
+    with pytest.raises(ValidationError):
+        Contact.model_validate({"name": "Ana"})
+`,
+      f.evals &&
+        `def test_eval_check():
+    assert check("Hello World", {"contains": ["hello", "bye"]}) == ["bye"]
+`,
+      f.observability &&
+        `def test_telemetry_writes_json(capsys):
+    telemetry.event("tool_call", name="x")
+    assert json.loads(capsys.readouterr().err)["event"] == "tool_call"
+`,
+    ].filter(Boolean) as string[];
+    const tests = [...toolTests, ...otherTests];
+    const imports = lines(
+      toolTests.length > 0 && "import asyncio",
+      f.observability && "import json",
+      (f.structured || (f.approval && f.tools)) && "",
+      (f.structured || (f.approval && f.tools)) && "import pytest",
+      f.structured && "from pydantic import ValidationError",
+      "",
+      f.observability && `from ${pkg} import telemetry`,
+      f.evals && `from ${pkg}.evals import check`,
+      f.structured && `from ${pkg}.schemas import Contact`,
+      toolTests.length > 0 && `from ${pkg}.tools import run_tool${f.approval ? ", set_approver" : ""}`,
+      f.approval &&
+        f.tools &&
+        `
+
+@pytest.fixture(autouse=True)
+def allow_tools():
+    async def allow(name, args):
+        return True
+
+    set_approver(allow)`,
+    );
+    files["tests/test_smoke.py"] = tests.length
+      ? `${imports.replace(/^\n+/, "")}
 
 
 ${tests.join("\n\n")}`
@@ -448,36 +759,121 @@ def test_agent_imports():
   return files;
 }
 
-function mainPy(mcp: boolean): string {
+function mainPy(f: ReturnType<typeof flags>): string {
+  const reply = f.streaming
+    ? '    await run(line, on_text=lambda text: print(text, end="", flush=True))\n    print()'
+    : "    print(await run(line))";
   const loop = `while True:
     try:
         line = await asyncio.to_thread(input, "you> ")
     except EOFError:
         break
-    print(await run(line))`;
+${reply}`;
   const indent = (s: string, n: number) => s.split("\n").map((l) => " ".repeat(n) + l).join("\n");
-  const body = mcp
-    ? `    await mcp_client.connect()\n    try:\n${indent(loop, 8)}\n    finally:\n        await mcp_client.close()`
-    : indent(loop, 4);
-  return `import asyncio
+  const body = lines(
+    f.approval && "    set_approver(ask)",
+    f.mcp
+      ? `    await mcp_client.connect()\n    try:\n${indent(loop, 8)}\n    finally:\n        await mcp_client.close()`
+      : indent(loop, 4),
+  );
+  return lines(
+    "import asyncio",
+    f.approval && "import json",
+    "",
+    "from dotenv import load_dotenv",
+    "",
+    "load_dotenv()",
+    "",
+    f.mcp && "from . import mcp_client  # noqa: E402",
+    "from .agent import run  # noqa: E402",
+    f.approval && "from .tools import set_approver  # noqa: E402",
+    f.approval &&
+      `
 
-from dotenv import load_dotenv
+async def ask(name: str, args: dict) -> bool:
+    answer = await asyncio.to_thread(input, f"\\nallow {name}({json.dumps(args)})? [y/N] ")
+    return answer.strip().lower() == "y"`,
+    "",
+    "",
+    "async def main() -> None:",
+    body,
+    "",
+    "",
+    'if __name__ == "__main__":',
+    "    try:",
+    "        asyncio.run(main())",
+    "    except KeyboardInterrupt:",
+    "        pass",
+    "",
+  );
+}
 
-load_dotenv()
-
-${mcp ? "from . import mcp_client  # noqa: E402\n" : ""}from .agent import run  # noqa: E402
-
-
-async def main() -> None:
-${body}
-
-
-if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        pass
-`;
+function extractPy(o: Options, f: ReturnType<typeof flags>): string {
+  const system = '"Extract the contact details from the user\'s text. Use an empty string for anything missing."';
+  const call = f.langgraph
+    ? lines(
+        `    model = ${f.anthropic ? "ChatAnthropic(model=MODEL, max_tokens=MAX_TOKENS)" : 'ChatOpenAI(model=MODEL, base_url=os.getenv("OPENAI_BASE_URL"), max_tokens=MAX_TOKENS)'}`,
+        "    result = await model.with_structured_output(Contact).ainvoke([(\"system\", SYSTEM), (\"human\", text)])",
+        "    return Contact.model_validate(result)",
+      )
+    : f.anthropic
+      ? lines(
+          "    resp = await client.messages.create(",
+          "        model=MODEL,",
+          "        max_tokens=MAX_TOKENS,",
+          "        system=SYSTEM,",
+          '        messages=[{"role": "user", "content": text}],',
+          '        tools=[{"name": "record_contact", "description": "Records the contact details found in the text.", "input_schema": Contact.model_json_schema()}],',
+          "        # Forcing the tool makes the model answer with arguments that follow the schema.",
+          '        tool_choice={"type": "tool", "name": "record_contact"},',
+          "    )",
+          '    block = next(b for b in resp.content if b.type == "tool_use")',
+          "    return Contact.model_validate(block.input)",
+        )
+      : lines(
+          "    resp = await client.chat.completions.create(",
+          "        model=MODEL,",
+          '        messages=[{"role": "system", "content": SYSTEM}, {"role": "user", "content": text}],',
+          `        ${o.provider === "ollama" ? "max_tokens" : "max_completion_tokens"}=MAX_TOKENS,`,
+          '        response_format={"type": "json_schema", "json_schema": {"name": "contact", "schema": Contact.model_json_schema(), "strict": True}},',
+          "    )",
+          '    return Contact.model_validate_json(resp.choices[0].message.content or "{}")',
+        );
+  return lines(
+    "import asyncio",
+    "import os",
+    "import sys",
+    "",
+    "from dotenv import load_dotenv",
+    "",
+    "load_dotenv()",
+    "",
+    f.langgraph
+      ? f.anthropic
+        ? "from langchain_anthropic import ChatAnthropic  # noqa: E402"
+        : "from langchain_openai import ChatOpenAI  # noqa: E402"
+      : f.anthropic
+        ? "from anthropic import AsyncAnthropic  # noqa: E402"
+        : "from openai import AsyncOpenAI  # noqa: E402",
+    "",
+    "from .schemas import Contact  # noqa: E402",
+    "",
+    !f.langgraph && (f.anthropic ? "client = AsyncAnthropic()" : "client = AsyncOpenAI()"),
+    `MODEL = os.getenv("MODEL", "${o.model}")`,
+    `MAX_TOKENS = int(os.getenv("MAX_TOKENS", "${MAX_TOKENS}"))`,
+    `SYSTEM = ${system}`,
+    "",
+    "",
+    "async def extract(text: str) -> Contact:",
+    '    """Pulls a Contact out of free text, validated against the schema."""',
+    call,
+    "",
+    "",
+    'if __name__ == "__main__":',
+    '    contact = asyncio.run(extract(" ".join(sys.argv[1:]) or sys.stdin.read()))',
+    "    print(contact.model_dump_json(indent=2))",
+    "",
+  );
 }
 
 function readme(o: Options, steps: string[]): string {

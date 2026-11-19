@@ -7,6 +7,10 @@ export function flags(o: Options) {
     memory: has("memory"),
     rag: has("rag"),
     mcp: has("mcp"),
+    streaming: has("streaming"),
+    structured: has("structured"),
+    observability: has("observability"),
+    evals: has("evals"),
     http: has("http"),
     docker: has("docker"),
     tests: has("tests"),
@@ -16,7 +20,15 @@ export function flags(o: Options) {
     vercel: o.framework === "vercel-ai",
   };
   // RAG and MCP reach the model as tools, so any of the three needs the tool loop.
-  return { ...f, needsTools: f.tools || f.rag || f.mcp };
+  const needsTools = f.tools || f.rag || f.mcp;
+  // Only fetch_url and MCP tools reach outside the process, so approval needs one of them.
+  return { ...f, needsTools, approval: has("approval") && (f.tools || f.mcp) };
+}
+
+// Glob patterns for the tools that need a yes before they run. MCP tools are named server__tool.
+export function confirmTools(o: Options): string {
+  const f = flags(o);
+  return [f.tools && "fetch_url", f.mcp && "*__*"].filter(Boolean).join(",");
 }
 
 // Defaults for the limits every generated agent reads from the environment.
@@ -24,7 +36,8 @@ export const MAX_TOKENS = 16000;
 export const MAX_STEPS = 10;
 
 export function envFile(o: Options): string {
-  const model = `MODEL=${o.model}\nMAX_TOKENS=${MAX_TOKENS}\nMAX_STEPS=${MAX_STEPS}\n`;
+  const approval = flags(o).approval ? `CONFIRM_TOOLS=${confirmTools(o)}\n` : "";
+  const model = `MODEL=${o.model}\nMAX_TOKENS=${MAX_TOKENS}\nMAX_STEPS=${MAX_STEPS}\n${approval}`;
   if (o.provider === "anthropic") return "ANTHROPIC_API_KEY=your-key-here\n" + model;
   if (o.provider === "openai") return "OPENAI_API_KEY=your-key-here\n" + model;
   return "OPENAI_BASE_URL=http://localhost:11434/v1\nOPENAI_API_KEY=ollama\n" + model;
@@ -76,6 +89,16 @@ Put your own .md files in this folder. The agent searches them with the search_k
 `;
 }
 
+export function evalCases(o: Options): string {
+  const f = flags(o);
+  const cases = [
+    { input: "What is your name?", contains: [o.name] },
+    { input: "Reply with the single word: ready", contains: ["ready"] },
+    f.rag && { input: "Search your knowledge base: who generated you?", contains: ["Arkitekt"] },
+  ].filter(Boolean);
+  return JSON.stringify(cases, null, 2) + "\n";
+}
+
 export function notes(o: Options): string[] {
   const f = flags(o);
   const out: string[] = [
@@ -85,5 +108,10 @@ export function notes(o: Options): string[] {
   if (f.memory) out.push("**Memory:** each session id keeps its own message history in memory. It resets when the process restarts.");
   if (f.rag) out.push("**RAG:** add `.md` files to `knowledge/`. Search is plain keyword matching; swap `rag` for an embeddings store when you need more.");
   if (f.mcp) out.push("**MCP:** list servers in `mcp_servers.json`. The sample entry runs the filesystem server with `npx`, so it needs Node installed. Remove it if you don't want it.");
+  if (f.streaming) out.push("**Streaming:** the CLI prints the reply as it arrives." + (f.http ? " `POST /chat/stream` takes the same body as `/chat` and sends server-sent events, one JSON-encoded text chunk per `data:` line." : ""));
+  if (f.structured) out.push("**Structured output:** `extract()` turns free text into a `Contact` validated by the schema in `schemas`. Change the fields to fit your data.");
+  if (f.approval) out.push("**Human in the loop:** tools matching `CONFIRM_TOOLS` need a yes before they run. The CLI asks in the terminal. Anything else declines them until you pass your own approver to `" + (o.language === "python" ? "set_approver" : "setApprover") + "`" + (f.http ? ", so the HTTP API declines them by default." : "."));
+  if (f.observability) out.push("**Observability:** every model call and tool call writes one JSON line to stderr with tokens and timings. Send it to your log collector, or swap `telemetry` for OpenTelemetry.");
+  if (f.evals) out.push("**Evals:** add cases to `evals/cases.json`. Each one passes when the answer contains every phrase in `contains`, ignoring case. Evals call the real model, so they need `.env` filled in.");
   return out;
 }
